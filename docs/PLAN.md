@@ -1,270 +1,352 @@
 # Phase 1 plan — marketing site + inquiry form + private admin
 
-Status: **awaiting approval**. Nothing below is built yet.
+Status: **rev 2.** Sections 4–7 approved (rev 1, decisions folded in). Sections 1–3 rewritten for Cloudflare, **awaiting review**. Nothing is built yet.
+
+---
+
+## 0. Host: Cloudflare Workers (Free plan)
+
+- **Commercial use:** Cloudflare's Self-Serve Subscription Agreement (last updated Sept 2025) has no non-commercial clause. Vercel Hobby has an explicit one. Cloudflare's own plans FAQ presents the Free plan as fine for websites, and community answers confirm business sites are fine on Free. The only service-specific restriction I found concerns serving video, which doesn't apply here.
+  - *Caveat:* I couldn't open cloudflare.com from this build sandbox (blocked by its network policy), so this comes from search results quoting the terms, not my own reading. Erez should skim the "Restrictions" section of https://www.cloudflare.com/terms/ when he signs up.
+- **Free-plan limits that matter:**
+  - Static-asset requests are **free and unlimited**.
+  - Requests that run Worker code: 100,000/day, **10 ms CPU** each.
+  - 5 cron triggers per account.
+  - Workers Builds (deploy from GitHub): 3,000 build minutes/month.
+- **URL:** `<name>.<account>.workers.dev` for build/preview. A `.co.il` can be attached before launch (custom domains are free; DNS can move to Cloudflare for free). The site URL lives in one env var (`SITE_URL`).
+- **No SLA** on the Free plan. That's acceptable for this site.
 
 ---
 
 ## 1. Architecture
 
+### Why the shape changed from rev 1
+On Workers Free, every request that runs server code is capped at **10 ms CPU** and counts toward the 100k/day limit. Static files cost nothing and have no limit. Running the full Next.js server on Workers (via the OpenNext adapter) would send every page view through Worker code. It would also be the most fragile part of the stack.
+
+So:
+- **Next.js 16 + Tailwind v4 with `output: 'export'`:** the public site and the admin UI are prebuilt static files.
+- **One small Worker** (plain TypeScript, ~200 lines) handles only `/api/*` plus a daily cron.
+
+**Stated deviation from the preferred stack:** Next.js is still the framework, but without Next's server features (Server Actions, middleware, server-side rendering). The reason is the 10 ms CPU limit and lower maintenance on the chosen host.
+
 ```
-Parent's phone ──► static Hebrew page (pre-rendered at build, served from CDN)
-                     │  WhatsApp button → wa.me/972XXXXXXXXX?text=<prefilled Hebrew>
-                     │  inquiry form (works even before JS loads: Next.js Server Action)
-                     ▼
-               Server action  submitInquiry()
-                 1. honeypot field + "submitted too fast" time-trap  → silently drop bots
-                 2. per-IP best-effort limiter (in memory, IP never stored)
-                 3. zod validation (same rules as the DB constraints)
-                 4. INSERT into Supabase with the *anon* key (RLS: insert-only)
-                    └─ DB trigger: global throttle + same-phone cooldown (cannot be bypassed)
-                 5. email Erez via Resend (if the DB insert failed, the email carries the
-                    full inquiry so the lead is never lost)
-                 6. return → thank-you state + WhatsApp fallback button
+PARENT'S PHONE
+  GET /  /privacy  /og.png …  ─► Cloudflare static assets (prebuilt; free; no Worker run)
+  WhatsApp button             ─► wa.me/972XXXXXXXXX?text=<prefilled message from he.json>
+  POST /api/inquiry           ─► WORKER
+                                   1. honeypot field + time-trap (submitted < 3 s after load)
+                                      → bot gets a fake "thanks", nothing stored or sent
+                                   2. per-IP limit (Cloudflare rate-limit binding; IP never stored)
+                                   3. zod validation (same rules as the DB constraints)
+                                   4. Supabase RPC submit_inquiry(data, FORM_KEY)  ← the ONLY write path
+                                   5. email Erez via Resend
+                                      (if step 4 failed, this email carries the full inquiry → lead not lost)
+                                   6. JSON → thank-you state with WhatsApp fallback
+                                      (no-JS: plain form POST → 303 redirect to /?sent=1#contact)
 
-Erez ──► /admin ──(no session)──► /login  (enter email)
-             server checks email === ADMIN_EMAIL, then Supabase signInWithOtp(shouldCreateUser:false)
-             email contains a link (/auth/confirm?token_hash=…) AND a 6-digit code
-             → session cookie (long-lived, he stays logged in on his phone)
-         /admin pages are server-rendered and query Supabase *with Erez's JWT* → RLS decides
+EREZ'S PHONE
+  GET /admin                  ─► static shell: no data, no secrets → shows login screen if no session
+  POST /api/admin/login       ─► WORKER: email == ADMIN_EMAIL ?
+                                   yes → Supabase signInWithOtp(shouldCreateUser: false)
+                                   always → same generic reply ("if allowed, a link was sent")
+  email: link /auth/confirm?token_hash=… AND a 6-digit code ─► session stored in his browser
+  list / status / notes / delete ─► browser → Supabase directly, with Erez's JWT → RLS is_admin()
 
-Daily scheduled job ──► /api/keepalive (CRON_SECRET) ──► tiny DB call
-             (Supabase free projects pause after 7 days without activity — this prevents it)
+CRON (Worker scheduled handler, daily) ─► Supabase keepalive()
+  (Supabase Free pauses a project after 7 days without activity)
 ```
 
-**Stack (as preferred):** Next.js 16 (App Router, TypeScript) + Tailwind v4, Supabase (Postgres + Auth + RLS), Resend for email. Hosting: see §4 — I am flagging a terms-of-service issue with Vercel Hobby and need a decision.
-
-Design choices worth calling out:
-
-- **No service-role key at runtime.** The public form writes with the anon key (RLS insert-only); the admin reads/writes with Erez's own session (RLS admin-only). A leaked server env var therefore can't dump the table unless it's the admin's session.
-- **Supabase keys stay server-side** (not `NEXT_PUBLIC_*`). The browser never talks to Supabase directly. RLS is still written as if the anon key were public (defense in depth).
-- **Public page is fully static** → Lighthouse ≥ 90 is easy to hold; only the form submission and /admin hit a server.
-- **Self-hosted Hebrew font** via `next/font` (Heebo or Assistant, Hebrew subset only), `display: swap`.
-- **RTL done with logical properties** (`ms-/me-/ps-/pe-/start/end`), `<html lang="he" dir="rtl">`; directional arrows flipped with `rtl:` variants; brand logos (WhatsApp) not mirrored; phone input is `dir="ltr"` inside the RTL form with right-aligned text (digits read correctly, layout stays RTL).
-- **Prices off = not rendered at all** (not CSS-hidden), so amounts never leak into the HTML.
-- **Pre-launch guard:** `settings.indexable` defaults to `false` → `noindex` until Erez fills the placeholders, so Google never indexes "[TEXT ABOUT EREZ]". `npm run check:placeholders` lists every remaining placeholder.
+### Key design choices
+- **No Supabase secret / service-role key anywhere.** The Worker holds a `FORM_KEY` that can only insert inquiries. The admin uses Erez's own session. The worst a leaked Worker secret allows is inserting rows.
+- **The Supabase publishable (anon) key is in the browser bundle** (needed for the admin login). This is by Supabase's design. The database is configured on the assumption that the key is public: anon can't touch any table directly (see §3).
+- **The `/admin` shell is public; the data is not.** The HTML/JS of the admin page holds no data and no secrets. Everything is fetched after login and gated by RLS. *Optional hardening (not in default scope):* put Cloudflare Access (free, email one-time code) in front of `/admin*`, so the shell itself isn't served without a login. That adds a second login step for Erez. → **review point R1**
+- **Worker CPU stays far under 10 ms:** the Worker mostly waits on network calls (Supabase, Resend), and waiting doesn't count toward the limit.
+- **Deploys:** Workers Builds, connected to GitHub. A push to `main` deploys production; other branches get preview URLs. Copy edits made in GitHub's web editor go live in about 2 minutes.
+- **Other choices carried over from rev 1:**
+  - The content file is checked at build time; a broken edit fails the build and the old version stays live.
+  - Hebrew font is self-hosted.
+  - RTL uses logical properties.
+  - Prices aren't rendered at all when the flag is off.
+  - The site is `noindex` until `indexable: true`.
+  - A script lists any placeholders still unfilled.
 
 ### Repo layout
-
 ```
-content/he.json              ← ALL copy + flags (showPrices, indexable, testimonials[], whatsapp number…)
-content/schema.ts            ← zod schema; a broken edit fails the build with a readable error
-                               (the previous deploy stays live, so a typo can't take the site down)
-src/app/page.tsx             ← main page (static)
-src/app/privacy/page.tsx     ← privacy note (text from he.json)
-src/app/login/, src/app/auth/confirm/route.ts
-src/app/admin/               ← list, status, notes, delete, counts
-src/app/api/keepalive/route.ts
-src/app/sitemap.ts, robots.ts, opengraph image (static PNG, see §6)
-src/lib/phone.ts             ← Israeli phone validate/normalize/format, wa.me link builder
-src/lib/supabase/, email.ts, rate-limit.ts
+content/he.json            ← ALL copy + flags (showPrices, indexable, testimonials[], whatsapp…)
+content/schema.ts          ← zod schema for he.json
+src/app/page.tsx           ← main page (static)
+src/app/privacy/page.tsx   ← privacy note
+src/app/admin/page.tsx     ← admin SPA (client-side; login view + dashboard)
+src/app/auth/confirm/page.tsx
+src/app/sitemap.ts, robots.ts
+src/components/…           ← sections, form, admin pieces
+src/lib/phone.ts           ← IL phone validate / normalize / format / wa.me link (shared by form, Worker, admin)
+src/lib/inquiry-schema.ts  ← zod schema shared by form + Worker
+src/lib/funnel.ts          ← count logic (unit-tested)
+worker/index.ts            ← /api/inquiry, /api/admin/login, scheduled keepalive
+wrangler.jsonc             ← assets = ./out, run_worker_first = ["/api/*"], cron, rate-limit binding
 supabase/migrations/0001_init.sql
-supabase/tests/rls.sql       ← RLS test suite
-tests/e2e/                   ← Playwright: 375px above-the-fold, RTL, form, flags
-scripts/og.ts, check-placeholders.ts, verify-rls.ts (smoke test against the live project)
+supabase/tests/rls.test.sql
+tests/unit, tests/e2e      ← vitest, Playwright
+scripts/og.ts, check-placeholders.ts, verify-rls.ts
 .env.example, README.md
 ```
+
+### Environment variables
+| Var | Where | Secret? |
+|---|---|---|
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | build (browser) | no (public by design) |
+| `NEXT_PUBLIC_SITE_URL` | build | no |
+| `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY` | Worker | no |
+| `FORM_KEY` | Worker secret (its SHA-256 hash is stored in the DB) | **yes** |
+| `ADMIN_EMAIL` | Worker secret | mildly |
+| `RESEND_API_KEY` | Worker secret | **yes** |
+| `NOTIFY_EMAIL_TO` | Worker (defaults to `ADMIN_EMAIL`) | mildly |
 
 ---
 
 ## 2. Data model
 
-One table, plus one tiny config table. No child name, no IP, no user agent, no cookies/analytics.
+One data table, an admin allow-list, and a private settings table. Nothing about the child beyond their grade. No IP, user agent, cookies or analytics.
 
 ```sql
 create type inquiry_status as enum ('new','contacted','trial_booked','paying','lost');
-create type inquiry_need   as enum ('falling_behind','test_prep','transition_7','confidence','other');
+create type inquiry_need   as enum ('transition_7','test_gaps','falling_behind','confidence','other');
 create type inquiry_source as enum ('facebook_group','whatsapp_group','referral','google','notice_board','other');
 
-create table inquiries (
+create table public.inquiries (
   id                 uuid primary key default gen_random_uuid(),
   created_at         timestamptz not null default now(),
 
   -- from the form
-  parent_first_name  text not null  check (char_length(parent_first_name) between 1 and 40),
-  phone              text not null  check (phone ~ '^0(5\d{8}|7\d{8}|[23489]\d{7})$'),  -- normalized, digits only
+  parent_first_name  text not null check (char_length(btrim(parent_first_name)) between 1 and 40),
+  phone              text not null check (phone ~ '^0(5\d{8}|7\d{8}|[23489]\d{7})$'),  -- normalized digits
   grade              smallint not null check (grade between 1 and 9),
   need               inquiry_need not null,
-  area               text not null  check (char_length(area) between 1 and 60),
-  message            text           check (char_length(message) <= 1000),
+  area               text not null check (char_length(btrim(area)) between 1 and 60),
+  message            text check (char_length(message) <= 1000),
   source             inquiry_source not null,
-  privacy_version    text not null,                         -- which privacy note they agreed to
+  privacy_version    text not null check (char_length(privacy_version) <= 20),
   consented_at       timestamptz not null default now(),
-  landing_ref        text check (char_length(landing_ref) <= 40),  -- OPTIONAL, see decision D4
+  landing_ref        text check (landing_ref ~ '^[a-z0-9-]{1,40}$'),   -- only if D4 = yes
 
   -- admin only
   status             inquiry_status not null default 'new',
   notes              text check (char_length(notes) <= 5000),
-  contacted_at       timestamptz,   -- first time each stage was reached;
-  trial_booked_at    timestamptz,   -- lets the funnel show "how many ever reached X"
-  paying_at          timestamptz,   -- even after an inquiry later becomes "lost"
+  contacted_at       timestamptz,     -- first time each stage was reached
+  trial_booked_at    timestamptz,
+  paying_at          timestamptz,
   lost_at            timestamptz,
   updated_at         timestamptz not null default now()
 );
-create index on inquiries (created_at desc);
+create index inquiries_created_at_idx on public.inquiries (created_at desc);
+create index inquiries_phone_created_idx on public.inquiries (phone, created_at desc);
 
-create table admin_users (email text primary key check (email = lower(email)));
+create table public.admin_users (email text primary key check (email = lower(email)));
+
+create schema private;                              -- NOT exposed through the Supabase API
+create table private.settings (
+  id               boolean primary key default true check (id),   -- single row
+  form_key_sha256  bytea not null
+);
 ```
 
-- **Status pipeline:** `new → contacted → trial_booked → paying`, or `lost` (not a fit / lost) from any stage. A trigger stamps the `*_at` column the first time a stage is reached (and fills earlier stages if one was skipped, e.g. new → paying).
-- **Funnel counts** (top of /admin): (a) current count per status, (b) "reached" counts from the `*_at` columns, (c) inquiries per source, plus a small source × outcome table (which groups actually produce paying students). All computed in one SQL query.
-- **Deletion:** hard `DELETE` from /admin with a confirm step. Free-tier Supabase has no point-in-time recovery, so a deleted row is gone (only transient logs remain).
-- **Phone:** accepts `050-1234567`, `0501234567`, `+972 50 123 4567`, landlines; stored normalized (`0501234567`), shown formatted, WhatsApp link only for mobiles (05X).
+**Notes:**
+- **"Help with" options:** labels and display order come from `he.json`, with "מעבר לכיתה ז'" and "השלמת פערים לפני מבחן" first. The enum keys are stable, so reordering or relabeling never needs a migration. `test_prep` from rev 1 is renamed `test_gaps` to match the new label.
+- **Area field:** service area is Tel Aviv only, so it's labeled "שכונה" (free text). A parent from outside Tel Aviv can still write their city, and Erez decides.
+- **Status pipeline:** `new → contacted → trial_booked → paying`, or `lost` from any stage. A `BEFORE UPDATE` trigger stamps the matching `*_at` column the first time a stage is reached. It also back-fills skipped earlier stages (e.g. new → paying), and sets `updated_at`. "Lost" keeps the earlier stamps, so the funnel still shows how far an inquiry got.
+- **Counts shown at the top of /admin:**
+  - current count per status
+  - "ever reached" count per stage, taken from the `*_at` columns
+  - total per source
+  - a source × outcome table
+  - These are computed in the browser from the fetched rows by `src/lib/funnel.ts` (unit-tested); a database view isn't worth it at this volume.
+- **Deletion:** a permanent `DELETE` with a confirm step. Supabase Free has no point-in-time recovery.
+- **Phone:** accepts `050-1234567`, `0501234567`, `+972 50 123 4567`, `972501234567`, and landlines. It's stored normalized and shown formatted. The WhatsApp link appears only for mobile numbers (05X).
 
 ---
 
 ## 3. Auth + RLS
 
-**Login (single user):**
-1. Supabase Auth with **public sign-ups disabled**. Erez's user is created once (invite from the Supabase dashboard).
-2. `/login` server action rejects any email ≠ `ADMIN_EMAIL` *before* calling Supabase (generic "a link was sent if allowed" message so the admin email isn't revealed), and calls `signInWithOtp({ shouldCreateUser: false })`.
-3. Email template uses `token_hash` links (verified server-side) instead of the PKCE flow, so the link works even if Gmail opens it in a different browser than the one he started in — a common magic-link failure on phones. The same email also shows a 6-digit code as a fallback.
-4. `middleware.ts` refreshes the session and redirects `/admin/*` to `/login` when there's none. `/admin` and `/login` are `noindex` and disallowed in robots.txt.
+### Login (single user)
+1. Supabase Auth with **sign-ups disabled**. Erez's account is created once by an invite from the dashboard.
+2. `/api/admin/login` (Worker) compares the email to `ADMIN_EMAIL`, case-insensitively.
+   - If it matches, it calls Supabase OTP with `shouldCreateUser: false`.
+   - If not, it does nothing.
+   - The reply is identical either way, so the page doesn't reveal which email is the admin's.
+   - A per-IP rate limit applies.
+3. **Email template:**
+   - The link is `{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email`, verified with `verifyOtp`. This works even when Gmail opens the link in a different browser than the one where he asked for it (the PKCE flow breaks in that case).
+   - The same email shows `{{ .Token }}` as a 6-digit code he can type in instead.
+4. **Session:** stored in his browser and refreshed automatically, so he stays logged in on his phone. A "log out" button signs out of every device.
+5. **Supabase's built-in mailer only sends to the project's team members**, so `ADMIN_EMAIL` must be the address Erez signs up to Supabase with. After the domain is bought, login emails can switch to Resend SMTP.
 
-**RLS (the real gate, independent of app code):**
+**Why a non-allowed email can't log in** (three independent layers):
+- the Worker refuses to request a link;
+- Supabase refuses to create an account (sign-ups are off);
+- even an account that somehow exists sees **zero rows**, because its email isn't in `admin_users`.
+
+### Database privileges + RLS
+The publishable key is assumed public. Anon therefore gets **no table privileges at all**. The only way to insert is an RPC that needs `FORM_KEY`, which only the Worker holds.
 
 ```sql
-alter table inquiries enable row level security;
-revoke all on inquiries, admin_users from anon, authenticated;
+-- Lock everything down first (Supabase grants anon/authenticated broad defaults on public)
+alter table public.inquiries   enable row level security;
+alter table public.admin_users enable row level security;
+revoke all on public.inquiries, public.admin_users from anon, authenticated, public;
+revoke all on schema private from anon, authenticated, public;
 
--- anon: INSERT only, only form columns (status/notes/stage dates are not insertable)
-grant insert (parent_first_name, phone, grade, need, area, message, source,
-              privacy_version, landing_ref) on inquiries to anon;
-create policy form_insert on inquiries for insert to anon with check (true);
--- no SELECT/UPDATE/DELETE grant or policy for anon at all
-
--- admin: everything, but only if the logged-in email is in admin_users
-create function is_admin() returns boolean language sql stable security definer
-  set search_path = '' as $$
+-- Admin check: helper lives in `private`, so it isn't callable via the API
+create function private.is_admin() returns boolean
+  language sql stable security definer set search_path = '' as $$
   select exists (select 1 from public.admin_users
-                 where email = lower(auth.jwt() ->> 'email'));
+                 where email = lower(coalesce(auth.jwt() ->> 'email', '')));
 $$;
-grant select, delete, update (status, notes) on inquiries to authenticated;
-create policy admin_select on inquiries for select to authenticated using (is_admin());
-create policy admin_update on inquiries for update to authenticated using (is_admin()) with check (is_admin());
-create policy admin_delete on inquiries for delete to authenticated using (is_admin());
+revoke all on function private.is_admin() from public;
+grant usage on schema private to authenticated;
+grant execute on function private.is_admin() to authenticated;
+
+-- Admin: read, change status/notes only, delete
+grant select, delete on public.inquiries to authenticated;
+grant update (status, notes) on public.inquiries to authenticated;
+create policy admin_select on public.inquiries for select to authenticated using (private.is_admin());
+create policy admin_update on public.inquiries for update to authenticated
+  using (private.is_admin()) with check (private.is_admin());
+create policy admin_delete on public.inquiries for delete to authenticated using (private.is_admin());
+-- No INSERT for authenticated; no policies at all on admin_users (managed in the SQL editor)
+
+-- The only write path for the public form
+create function public.submit_inquiry(form_key text, p jsonb) returns void
+  language plpgsql security definer set search_path = '' as $$
+begin
+  -- 1. caller must hold FORM_KEY (compared by SHA-256)
+  -- 2. throttle: reject if > 20 inquiries in the last hour or > 60 in the last day (global)
+  -- 3. duplicate guard: same phone within 10 minutes → return quietly (no second row)
+  -- 4. insert ONLY the form columns from p; status/notes/stage dates are never taken from input
+end $$;
+revoke all on function public.submit_inquiry(text, jsonb) from public;
+grant execute on function public.submit_inquiry(text, jsonb) to anon;
+
+create function public.keepalive() returns timestamptz language sql stable as $$ select now() $$;
+revoke all on function public.keepalive() from public;  grant execute on function public.keepalive() to anon;
 ```
 
-Plus a `BEFORE INSERT` trigger (security definer) that rejects inserts when there were > N inquiries in the last hour globally, or the same phone within the last 10 minutes. This bounds abuse even if someone calls the Supabase API directly, and keeps email volume under Resend's 100/day.
+**How this maps to the acceptance criterion** ("anon cannot read or write the inquiries table except INSERT via the form"):
+- Anon cannot `SELECT`, `INSERT`, `UPDATE` or `DELETE` the table directly. Not even direct `INSERT` works, so nobody can skip the honeypot and rate limit by calling Supabase with the public key.
+- The form's insert goes through `submit_inquiry`, and only with the Worker's `FORM_KEY`.
+- This is stricter than an "anon may INSERT" policy, and I think it's the right reading of "INSERT via the form". → **review point R2**
+- **Alternative I rejected:** have the Worker insert with the Supabase secret (service-role) key. That works, but the key bypasses all RLS, so a leak would expose every inquiry.
 
-Three independent layers keep a non-allowed email out: the app refuses to send the link; Supabase refuses to create the account (sign-ups off); RLS returns nothing to any JWT whose email isn't in `admin_users`.
+**Throttle numbers:**
+- 20/hour and 60/day globally, tuned to Resend Free's 100 emails/day and far above any real volume.
+- When the throttle trips, the parent sees a polite error with the WhatsApp button.
+- The numbers are constants at the top of the migration.
 
-**RLS tests** (`supabase/tests/rls.sql`, run in CI via the Supabase CLI and locally against Postgres):
-- anon: INSERT ok · SELECT/UPDATE/DELETE denied · cannot set `status`/`notes` on insert
-- authenticated non-admin email: sees 0 rows, cannot update/delete
-- admin: select/update/delete ok
-- constraint checks: bad phone, grade 10, oversized text rejected; throttle trigger fires
-- `scripts/verify-rls.ts`: same anon checks against the **live** project after deploy.
+### RLS test suite (`supabase/tests/rls.test.sql`)
+**Runs:**
+- in CI (GitHub Actions + Supabase CLI local stack);
+- in this sandbox against plain Postgres with Supabase's `anon` / `authenticated` roles and `auth.jwt()` emulated;
+- `scripts/verify-rls.ts` repeats the anon checks against the **live** project after setup.
 
-**Rotating the admin email:** change `ADMIN_EMAIL` in the host's env vars, run one SQL line (`update admin_users set email = 'new@…'`), invite the new user in Supabase. README will have the exact steps.
+**Checks:**
 
----
-
-## 4. Hosting / email / domain options (costs)
-
-Free-tier numbers are as I know them; please verify current terms on each site before signing up.
-
-### Hosting — **decision needed (D1)**
-
-| Option | Cost | Notes |
+| As | Check | Expected |
 |---|---|---|
-| Vercel Hobby (your preferred) | $0 | Best Next.js support, daily cron included. **Hobby terms restrict it to non-commercial personal use**; a tutoring business site is commercial. Enforcement on tiny sites is rare, but it's a real ToS violation. Pro is $20/month. |
-| Netlify Free | $0 | Commercial use allowed. Good Next.js support, scheduled functions included. Credit-based free plan; ample for this site, though each deploy consumes credits (≈ tens of deploys/month). |
-| Cloudflare Workers Free (via OpenNext) | $0 | Commercial use allowed, very generous limits, cron triggers free. Slightly more setup; a bit more risk around Next.js feature compatibility. |
+| anon | `select` / `insert` / `update` / `delete` on `inquiries` | denied |
+| anon | `select` on `admin_users` | denied |
+| anon | `private.is_admin()` | not callable |
+| anon | `submit_inquiry` with a wrong or missing key | error, no row |
+| anon | `submit_inquiry` with the right key | exactly 1 row; status `new`, notes null, even if `p` tries to set them |
+| anon | invalid phone, grade 0 or 10, oversized text | rejected |
+| anon | throttle and duplicate guard | fire |
+| authenticated, non-admin email | `select` | 0 rows |
+| authenticated, non-admin email | `update` / `delete` | 0 rows affected |
+| admin | `select` / `update(status, notes)` / `delete` | work |
+| admin | updating `phone` or `created_at` | denied (column grant) |
+| admin | status trigger | stamps stage dates correctly, including skipped stages and lost-after-paying |
 
-**My recommendation:** Netlify Free (ToS-clean, near-zero config). I'll keep the code host-neutral either way (no Vercel-only APIs), so switching later is a redeploy, not a rewrite. If you prefer to stay on Vercel Hobby knowingly, that works technically.
+### Rotating the admin email
+1. Invite the new address in Supabase Auth.
+2. Run `update admin_users set email = 'new@…';`.
+3. Change `ADMIN_EMAIL` in Cloudflare.
+4. Delete the old Supabase user.
 
-### Database / auth — Supabase Free: $0
-500 MB DB (this will use < 1 MB/year), 50k monthly active users. **Pauses after 7 days of no activity** → mitigated by the daily keepalive and by the email fallback. Region: I'd pick **EU (Frankfurt)** — closest to Israel and the EU is an approved destination for transferring personal data out of Israel.
-
-### Email — Resend Free: $0
-3,000 emails/month, 100/day. Without a domain, Resend only delivers to the **account owner's own address** from `onboarding@resend.dev` — fine, since notifications only go to Erez, but **Erez must sign up to Resend with the address he wants notifications at**, and should add a "never send to spam" filter. With a custom domain later, sending from e.g. `site@<domain>` becomes possible.
-Login emails use Supabase's built-in mailer (free; only sends to project team members and is rate-limited to a few per hour — fine for one user).
-
-### Domain — **Erez's decision (D2)**, nothing is bought
-
-| Option | Approx. cost |
-|---|---|
-| Free host subdomain (`erez-math.netlify.app` / `.vercel.app` / `.workers.dev`) | $0 |
-| `.co.il` via an ISOC-IL accredited registrar | ≈ ₪50–90/year |
-| `.com` (e.g. Cloudflare Registrar, sold at cost) | ≈ $10–12/year |
-
-A real domain looks more trustworthy in a WhatsApp preview and is easier to say out loud; it's not required for launch. The site reads its URL from one env var, so adding a domain later is a 10-minute change.
-
-**Total running cost with the recommendation: $0/month** (optional domain only).
+The README will have copy-paste steps.
 
 ---
 
-## 5. Placeholders Erez must fill (all in `content/he.json`)
+## 4. Hosting / email / domain (approved; updated with decisions)
 
-Marketing copy — every one rendered as an obvious `[…]` placeholder until filled:
-1. Brand/display name (just "ארז"? full name? business name?)
-2. Hero headline + subheadline
-3. About me text; optional photo of Erez (file name in he.json)
-4. Method — text for each step (diagnosis lesson → personal plan → regular lessons → short parent update)
-5. Who it's for — topics list, **service areas** list
-6. How it works — text for the 3 steps (contact → trial lesson → ongoing plan); is the trial lesson free/paid? (business decision)
-7. Prices — amounts, lesson length, packages (section hidden until `showPrices: true`)
-8. FAQ questions + answers
-9. Privacy note text (I'll draft the structure required by Israeli law's notice duty — what's collected, why, who receives it, that it's voluntary, how to delete — as a placeholder; **should be reviewed**, I'm not giving legal advice)
-10. SEO title + meta description; OG preview text
-11. Testimonials — only real ones, with the parent's permission, no child names (empty by default)
+| Service | Plan | Cost | Notes |
+|---|---|---|---|
+| Cloudflare Workers + static assets + Workers Builds | Free | $0 | Commercial use OK (see §0). Previews on `*.workers.dev`. |
+| Supabase | Free | $0 | EU (Frankfurt) region. Pause after 7 idle days, handled by the daily keepalive. |
+| Resend | Free | $0 | 3,000/month, 100/day. Before the domain exists, it only delivers to the account owner's address, so Erez signs up to Resend with his notification address. After the `.co.il` is verified, mail comes from his domain and is less likely to be marked as spam. |
+| Domain | — | build on `workers.dev`; Erez buys a `.co.il` (≈ ₪50–90/yr) before public launch | Attach as a Cloudflare custom domain, then change `SITE_URL`. |
 
-Settings / facts:
-12. WhatsApp number (international format) + the prefilled Hebrew message
-13. Footer contact details: show phone number? email? (D5)
-14. `ADMIN_EMAIL` (login + notifications)
-15. Site URL / domain
-16. Accent color (I'll pick a neutral, calm palette defined in one place; changeable)
+Running cost: **$0/month** plus the domain.
 
-Functional UI text (form labels, validation errors, button labels, the thank-you message) I will write in plain Hebrew so the form works — it's editable in the same file, and makes no promises (e.g. no "I'll reply within an hour").
+## 5. Content (approved; updated with decisions)
 
----
+**Decided copy, used as-is:**
+- **Display name:** "ארז [שם משפחה] · מורה פרטי למתמטיקה" (the last name stays a placeholder).
+- **Hero headline:** "מעבר בטוח לחטיבה — בלי פערים במתמטיקה".
+- **Hero subheadline:** as given (grades 5–8, Tel Aviv, diagnosis → close gaps → confidence, before 7th grade and tests).
+- **Secondary line:** "מלמד גם כיתות א'–ט'".
+- **CTAs:** "דברו איתי בוואטסאפ" / "השאירו פרטים ואחזור אליכם".
+- **WhatsApp prefilled message:** as given.
+- **Service area:** "תל אביב" in copy, SEO meta and schema.org `areaServed`.
+- **First lesson:** "שיעור אבחון", paid, with "if it's not a fit, you don't pay"; the price stays a placeholder.
+- **"Help with" order:** "מעבר לכיתה ז'", then "השלמת פערים לפני מבחן", then the rest.
+- **Footer:** WhatsApp + phone only. No public email.
 
-## 6. SEO / sharing
+**Placeholders Erez still fills:** last name, about-me text, photo, FAQ, prices, WhatsApp/phone number, `ADMIN_EMAIL`.
 
-- `<title>`, meta description, canonical, `lang="he" dir="rtl"`, all from he.json.
-- **OG image:** a static 1200×630 PNG generated by `npm run og` (renders an HTML template in Chromium → correct Hebrew/RTL; `next/og`'s renderer does not handle RTL text reliably). Kept < 300 KB so WhatsApp shows it. Re-run after changing the name/headline. Note: WhatsApp/Facebook cache previews — use Facebook's Sharing Debugger to refresh.
-- schema.org JSON-LD `["LocalBusiness","EducationalOrganization"]` with name, telephone, `areaServed` from he.json. **No ratings, review counts or credentials** are ever emitted.
-- `sitemap.xml`, `robots.txt` (disallow `/admin`, `/login`; full `noindex` while `indexable: false`).
+**Placeholders I'll keep for sections the brief didn't cover:**
+- method-step details;
+- "who it's for" topics list;
+- how-it-works step text beyond the decided diagnosis-lesson terms.
 
----
+Each is clearly marked `[…]`. **Privacy note:** structure drafted and marked **"טיוטה — דורש בדיקה / needs review"**.
 
-## 7. How I'll test
+**Accent color:** calm teal/blue on warm off-white, with WCAG AA contrast; defined in one place.
 
-- **Unit (vitest):** phone validation/normalization, content schema, funnel-count logic.
-- **RLS:** SQL test suite above (CI with Supabase CLI; locally against Postgres with Supabase role shims) + live smoke script.
-- **E2E (Playwright, Chromium @ 375×667 and 390×844):** WhatsApp button and form CTA fully inside the first viewport; `dir=rtl` and computed layout direction on sections, form fields, phone input; arrows mirrored; form validation messages; successful submit → thank-you state; testimonials section absent with empty array and present with a fixture; prices absent when flag off and present when on (fixture builds); /admin redirects to /login; status + notes persist; delete removes the row; counts update.
-- **Lighthouse (mobile preset)** on the production build: assert performance & accessibility ≥ 90.
-- **Secrets:** `.env*` gitignored, `.env.example` documented, a grep check in CI for key-shaped strings.
+## 6. SEO / sharing (approved)
+- Title, description and canonical come from he.json, with a Tel Aviv focus.
+- Static 1200×630 OG image rendered in Chromium (handles Hebrew correctly).
+- JSON-LD `["LocalBusiness","EducationalOrganization"]` with `areaServed: תל אביב`; no ratings, reviews or credentials.
+- Sitemap; robots.txt disallows `/admin` and `/auth`; `noindex` until `indexable: true`.
 
-**Live preview URL:** I can't create accounts on Erez's behalf. I'll build and verify everything locally, then hand over a ~15-minute setup checklist (create Supabase project → run migration; create Resend account; connect the repo to the chosen host; paste env vars). Once those exist, I'll run the live checks (submit → admin → email, RLS smoke test, Lighthouse on the real URL).
+## 7. Testing (approved; host-adjusted)
+- **Unit:** vitest.
+- **RLS:** suite in §3.
+- **End-to-end:** Playwright at 375 px and 390 px. Checks:
+  - both CTAs visible without scrolling;
+  - RTL layout throughout;
+  - form validation and the thank-you state;
+  - the testimonials and prices toggles;
+  - admin login gate, status, notes and delete;
+  - the counts.
+- **Local Worker:** run with `wrangler dev`.
+- **Lighthouse:** mobile preset, performance and accessibility ≥ 90.
+- **Secrets:** a scan in CI.
+- **Live preview:** this sandbox can't reach Cloudflare's API, so deploys happen through Workers Builds after Erez connects the repo (setup checklist in the README, ~15 min). I'll then run the live checks on the preview URL.
 
----
+## 8. Risks (approved; additions marked ★)
+- Supabase pause → keepalive + email fallback.
+- Notification email in spam until the domain exists.
+- Magic link opened in a different browser → `token_hash` + 6-digit code.
+- Broken he.json → build fails safely.
+- Placeholders shared too early → `noindex` + checker.
+- Free-tier terms change → every service is swappable.
+- Privacy law (Amendment 13) → minimal data, consent version stored, deletion, EU region, note marked for review.
+- ★ Workers Free has no SLA, and a Worker can't use more than 10 ms CPU per request. Only 2 small endpoints run code, so this is fine at this scale.
+- ★ The Cloudflare rate-limit binding is per Cloudflare location, i.e. approximate. The DB throttle is the hard backstop.
+- ★ Commercial-use reading of Cloudflare's terms is from secondary sources (see §0) → Erez checks the terms at signup.
 
-## 8. Risks
-
-| Risk | Mitigation |
-|---|---|
-| Supabase free project pauses after 7 idle days → form fails | Daily keepalive job; if insert fails anyway, the email to Erez carries the full inquiry and the parent still sees the thank-you + WhatsApp button |
-| Vercel Hobby non-commercial terms | Decision D1; host-neutral code |
-| Notification email lands in spam (`onboarding@resend.dev`) | README: add a Gmail filter; custom domain later fixes it properly |
-| Magic link opened in a different browser on the phone | `token_hash` flow + 6-digit code fallback |
-| Bots bypass the form and hit the API directly | Column-level grants, DB constraints, DB-level throttle; no email is sent for those rows |
-| Erez breaks `he.json` while editing | Build-time schema validation; failed build keeps the old version live; README shows how to edit safely in GitHub's web editor |
-| Placeholders shared publicly before they're filled | `indexable: false` by default; `check:placeholders` script; I'd recommend not sharing the link until placeholders are filled |
-| Free tiers change terms/limits | All three services are swappable; README lists where each is configured |
-| Privacy law (Israeli Privacy Protection Law, Amendment 13 in force since Aug 2025) | Minimal data, consent + version stored, deletion, EU region, privacy note structure; **text needs Erez's/a professional's review** |
-| Phone number in emails stored at Resend/Gmail | Decision D3 — default to sending no name/phone in the email |
-| Dependency updates = maintenance | No Dependabot noise; pinned versions; nothing needs updating to keep running |
-
----
-
-## 9. Decisions needed before I build
-
-- **D1 Hosting:** Netlify Free (recommended) / Vercel Hobby (preferred stack, non-commercial ToS) / Cloudflare Workers.
-- **D2 Domain:** launch on the free subdomain now (recommended), or buy one first — Erez's call.
-- **D3 Notification email content:** (a) *recommended* — no name or phone: "New inquiry: grade 7, test prep, Holon, via Facebook group → open admin" (one extra tap; personal data stays out of email); or (b) full details including name + phone.
-- **D4 Link tagging:** allow `?src=holon-fb` on shared links, stored in `landing_ref` (shows which specific group post worked, independent of what parents tick). Not personal data. Recommended yes.
-- **D5 Public contact details:** show Erez's phone number in the footer (the WhatsApp link exposes it anyway)? Show an email?
-- **D6 Retention:** keep inquiries until manually deleted (simplest), or auto-delete `lost` inquiries after N months via a scheduled DB job (better privacy, still zero maintenance). Needs a number if yes.
-- **D7 Facts:** OK to state these as fact (not placeholder) in SEO title/schema: "private math tutor, grades 1–9, in-person lessons"? Everything else stays a placeholder.
+## 9. Still-open decisions
+- **D3 — notification email content.** Recommended: no name or phone in the email; he taps through to /admin. The DB-failure fallback email always carries full details.
+- **D4 — `?src=` link tagging into `landing_ref`.** Recommended: yes.
+- **D6 — retention.** Manual delete only, or auto-delete `lost` inquiries after N months (a daily job, no maintenance).
+- **R1 — Cloudflare Access in front of `/admin`.** Recommended: no for now; RLS already protects the data.
+- **R2 — insert via a keyed RPC instead of an anon INSERT policy.** Recommended: yes.
